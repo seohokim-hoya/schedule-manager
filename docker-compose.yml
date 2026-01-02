@@ -6,9 +6,10 @@ services:
     env_file:
       - .env
     volumes:
-      # Mount obsidian submodule as read-only for parsing
-      # The git pull happens inside the container
+      # Mount obsidian submodule for parsing and git pull
       - ./obsidian:/app/obsidian:rw
+      # Mount git modules for submodule to work
+      - ./.git/modules/obsidian:/app/.git/modules/obsidian:rw
       # Mount config.yml for persistent settings
       - ./config.yml:/app/config.yml:rw
     environment:

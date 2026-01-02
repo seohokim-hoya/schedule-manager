@@ -103,8 +103,30 @@ class Task:
 def pull_repo() -> tuple[bool, str]:
     try:
         repo = git.Repo(OBSIDIAN_PATH)
-        repo.remotes.origin.pull()
-        return True, "Synced"
+        
+        # Check for GitHub token (for Docker/portable usage)
+        github_token = os.getenv("GITHUB_TOKEN")
+        github_repo = os.getenv("GITHUB_REPO")
+        
+        if github_token and github_repo:
+            # Use HTTPS with token for authentication
+            # Format: https://TOKEN@github.com/user/repo.git
+            auth_url = github_repo.replace("https://", f"https://{github_token}@")
+            # Fetch and pull using authenticated URL
+            repo.git.fetch(auth_url, "main")
+            repo.git.reset("--hard", "FETCH_HEAD")
+            return True, "Synced"
+        else:
+            # Fallback to default remote (SSH or existing config)
+            if not repo.remotes:
+                logger.warning("No remotes configured")
+                return False, "No remotes"
+            origin = repo.remotes.origin if hasattr(repo.remotes, 'origin') else repo.remotes[0]
+            origin.pull()
+            return True, "Synced"
+    except git.InvalidGitRepositoryError:
+        logger.warning(f"{OBSIDIAN_PATH} is not a git repository")
+        return False, "Not a git repo"
     except Exception as e:
         logger.error(f"Git pull failed: {e}")
         return False, "Sync failed"
