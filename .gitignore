@@ -19,3 +19,5 @@ ENV/
 
 # Docker
 .docker/
+
+./config.yml
