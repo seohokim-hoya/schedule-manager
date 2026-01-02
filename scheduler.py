@@ -82,6 +82,8 @@ class Task:
     scheduled: Optional[datetime] = None
     start: Optional[datetime] = None
     recurrence: Optional[str] = None
+    time_range: Optional[str] = None  # e.g., "14:00-16:00"
+    place: Optional[str] = None       # e.g., "E3-1 3444"
 
     @property
     def primary_dt(self) -> Optional[datetime]:
@@ -89,10 +91,32 @@ class Task:
 
     @property
     def has_time(self) -> bool:
+        # Has time if time_range exists OR if primary_dt has non-zero time
+        if self.time_range:
+            return True
         dt = self.primary_dt
         return dt is not None and (dt.hour != 0 or dt.minute != 0)
+    
+    @property
+    def display_time(self) -> Optional[str]:
+        """Get display time: prefer time_range, fallback to primary_dt time"""
+        if self.time_range:
+            return self.time_range
+        dt = self.primary_dt
+        if dt and (dt.hour != 0 or dt.minute != 0):
+            return dt.strftime('%H:%M')
+        return None
 
     def sort_key(self) -> tuple:
+        # Sort by time_range first if exists, then by primary_dt
+        if self.time_range:
+            # Extract start time from range (e.g., "14:00-16:00" -> "14:00")
+            start_time = self.time_range.split('-')[0]
+            try:
+                h, m = map(int, start_time.split(':'))
+                return (0, datetime.min.replace(hour=h, minute=m))
+            except:
+                pass
         dt = self.primary_dt
         if dt is None:
             return (2, datetime.max)
@@ -149,8 +173,9 @@ DATE_PATTERNS = {
     "scheduled": re.compile(r"\[scheduled::\s*(\d{4}-\d{2}-\d{2}(?:\s+\d{1,2}:\d{2})?)\]"),
     "start": re.compile(r"\[start::\s*(\d{4}-\d{2}-\d{2}(?:\s+\d{1,2}:\d{2})?)\]"),
 }
-RECUR_PATTERN = re.compile(r"\[(?:recurs|repeat)::\s*([^\]]+)\]|🔁\s*([^\[]+)")
-
+RECUR_PATTERN = re.compile(r"\[(?:recurs|repeat)::\s*([^\]]+)\]|🔁\s*([^\[]+)")# Pattern for @[time]/[place] format
+# Matches: @[14:00-16:00]/[E3-1 3444], @/[place], @[time], or nothing
+TIME_PLACE_PATTERN = re.compile(r"@(?:\[([^\]]+)\])?(?:/\[([^\]]+)\])?\s*")
 
 def parse_task(line: str, source: str) -> Optional[Task]:
     match = TASK_PATTERN.match(line)
@@ -159,7 +184,20 @@ def parse_task(line: str, source: str) -> Optional[Task]:
 
     completed = match.group(1).lower() == "x"
     content = match.group(2)
-    text = METADATA_PATTERN.sub("", content)
+    
+    # Parse @[time]/[place] format
+    time_range = None
+    place = None
+    tp_match = TIME_PLACE_PATTERN.search(content)
+    if tp_match and (tp_match.group(1) or tp_match.group(2)):
+        time_range = tp_match.group(1)  # e.g., "14:00-16:00" or None
+        place = tp_match.group(2)        # e.g., "E3-1 3444" or None
+        # Remove the @[time]/[place] part from text
+        content_for_text = TIME_PLACE_PATTERN.sub("", content)
+    else:
+        content_for_text = content
+    
+    text = METADATA_PATTERN.sub("", content_for_text)
     text = re.sub(r"🔁\s*[^\[]*", "", text).strip()
 
     if not text:
@@ -169,7 +207,8 @@ def parse_task(line: str, source: str) -> Optional[Task]:
     recur_match = RECUR_PATTERN.search(content)
     recurrence = (recur_match.group(1) or recur_match.group(2)).strip() if recur_match else None
 
-    return Task(text=text, completed=completed, source=source, recurrence=recurrence, **dates)
+    return Task(text=text, completed=completed, source=source, recurrence=recurrence, 
+                time_range=time_range, place=place, **dates)
 
 
 def get_all_tasks() -> list[Task]:
@@ -264,64 +303,58 @@ def esc(text: str) -> str:
 
 
 def fmt_task(t: Task, show_time: bool = True, show_date: bool = False, show_source: bool = False) -> str:
-    """Format task in 2-line format for better mobile readability (HTML)"""
+    """
+    Format task with blockquote (HTML)
+    Line 1: <code>time</code> · place · source
+    Line 2: <blockquote>task name</blockquote>
+    """
     recur = " (repeat)" if t.recurrence else ""
     
-    # Build prefix (time or date)
-    if show_time and t.has_time:
-        prefix = t.primary_dt.strftime('%H:%M')
+    # Build info parts: time/date, place, source
+    parts = []
+    
+    if show_time and t.display_time:
+        parts.append(f"<code>{t.display_time}</code>")
     elif show_date and t.primary_dt:
-        prefix = t.primary_dt.strftime('%m/%d')
+        parts.append(f"<code>{t.primary_dt.strftime('%m/%d')}</code>")
     elif show_time:
-        prefix = "all-day"
-    else:
-        prefix = ""
+        parts.append("<code>all-day</code>")
     
-    # Build first line: prefix | source
-    if show_source and prefix:
-        first_line = f"{prefix} | {esc(t.source)}"
-    elif show_source:
-        first_line = esc(t.source)
-    elif prefix:
-        first_line = prefix
-    else:
-        first_line = ""
+    if t.place:
+        parts.append(esc(t.place))
     
-    # Task text
+    if show_source:
+        parts.append(esc(t.source))
+    
+    # First line: time · place · source
+    info_line = " · ".join(parts) if parts else ""
+    
+    # Task text in blockquote
     text = f"{esc(t.text)}{recur}"
     
     if t.completed:
-        if show_source:
-            return f"<s>{first_line}</s>\n    <s>{text}</s>"
-        return f"<s>{prefix} | {text}</s>" if prefix else f"<s>{text}</s>"
+        return f"<s>{info_line}</s>\n<blockquote><s>{text}</s></blockquote>"
     
-    if show_source:
-        return f"{first_line}\n    {text}"
-    return f"{prefix} | {text}" if prefix else text
+    return f"{info_line}\n<blockquote>{text}</blockquote>"
 
 
 def fmt_tasks(tasks: list[Task], show_time: bool = True, show_date: bool = False, show_source: bool = False) -> str:
     if not tasks:
-        return "  none"
+        return "<i>none</i>"
     
     sorted_tasks = sorted(tasks, key=Task.sort_key)
+    lines = []
     
-    if show_time:
-        timed = [t for t in sorted_tasks if t.has_time]
-        allday = [t for t in sorted_tasks if not t.has_time]
-        lines = [f"  {fmt_task(t, show_time=True, show_source=show_source)}" for t in timed]
-        if timed and allday:
-            lines.append("")
-        lines += [f"  {fmt_task(t, show_time=True, show_source=show_source)}" for t in allday]
-        return "\n".join(lines)
+    for t in sorted_tasks:
+        lines.append(fmt_task(t, show_time=show_time, show_date=show_date, show_source=show_source))
     
-    return "\n".join(f"  {fmt_task(t, show_time=False, show_date=show_date, show_source=show_source)}" for t in sorted_tasks)
+    return "\n".join(lines)
 
 
 def fmt_overdue(tasks: list[Task]) -> str:
-    """Format overdue tasks: folder > date > time (oldest first) - HTML"""
+    """Format overdue tasks with blockquote (HTML)"""
     if not tasks:
-        return "  none"
+        return "<i>none</i>"
     
     # Group by source, then by date
     by_source: dict[str, dict[Optional[date_type], list[Task]]] = {}
@@ -335,9 +368,8 @@ def fmt_overdue(tasks: list[Task]) -> str:
     lines = []
     for src in sorted(by_source):
         src_tasks = by_source[src]
-        lines.append(f"  <b>{esc(src)}</b>")
+        lines.append(f"<b>{esc(src)}</b>")
         
-        # Sort dates: oldest first, None last
         sorted_dates = sorted(
             src_tasks.keys(),
             key=lambda d: (d is None, d or date_type.max)
@@ -345,16 +377,19 @@ def fmt_overdue(tasks: list[Task]) -> str:
         
         for d in sorted_dates:
             date_tasks = src_tasks[d]
-            # Sort by datetime (oldest first)
             date_tasks_sorted = sorted(date_tasks, key=lambda t: t.primary_dt or datetime.max)
             
-            date_str = d.strftime('%m/%d') if d else "(no date)"
-            lines.append(f"    {date_str}")
-            
             for t in date_tasks_sorted:
-                time_str = t.primary_dt.strftime('%H:%M') if t.has_time else "all-day"
+                time_str = t.display_time or "all-day"
+                date_str = d.strftime('%m/%d') if d else "no date"
                 recur = " (repeat)" if t.recurrence else ""
-                lines.append(f"      {time_str} | {esc(t.text)}{recur}")
+                
+                parts = [f"<code>{date_str}</code>", f"<code>{time_str}</code>"]
+                if t.place:
+                    parts.append(esc(t.place))
+                
+                lines.append(" · ".join(parts))
+                lines.append(f"<blockquote>{esc(t.text)}{recur}</blockquote>")
     
     return "\n".join(lines)
 
@@ -423,14 +458,13 @@ def build_all(tasks: list[Task]) -> str:
     lines = [f"<b>All Incomplete</b>", f"total {len(incomplete)}\n"]
 
     if not incomplete:
-        lines.append("  all done")
+        lines.append("<i>all done</i>")
     else:
         for src in sorted(by_source):
             src_tasks = by_source[src]
             total = sum(len(v) for v in src_tasks.values())
             lines.append(f"<b>{esc(src)}</b> ({total})")
             
-            # Sort dates: None last, then by date
             sorted_dates = sorted(
                 src_tasks.keys(),
                 key=lambda d: (d is None, d or date_type.max)
@@ -438,18 +472,19 @@ def build_all(tasks: list[Task]) -> str:
             
             for d in sorted_dates:
                 date_tasks = src_tasks[d]
-                # Sort by time within date
                 date_tasks_sorted = sorted(date_tasks, key=Task.sort_key)
                 
-                if d:
-                    lines.append(f"  {d.strftime('%m/%d')}")
-                else:
-                    lines.append("  (no date)")
-                
                 for t in date_tasks_sorted:
-                    time_str = t.primary_dt.strftime('%H:%M') if t.has_time else "all-day"
+                    time_str = t.display_time or "all-day"
+                    date_str = d.strftime('%m/%d') if d else "no date"
                     recur = " (repeat)" if t.recurrence else ""
-                    lines.append(f"    {time_str} | {esc(t.text)}{recur}")
+                    
+                    parts = [f"<code>{date_str}</code>", f"<code>{time_str}</code>"]
+                    if t.place:
+                        parts.append(esc(t.place))
+                    
+                    lines.append(" · ".join(parts))
+                    lines.append(f"<blockquote>{esc(t.text)}{recur}</blockquote>")
             lines.append("")
 
     return "\n".join(lines)
