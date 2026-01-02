@@ -4,21 +4,23 @@ Obsidian Tasks를 기반으로 한 텔레그램 일정 관리 봇입니다.
 
 ## 기능
 
-- 📅 **정기 알림**: 지정된 시간(9, 12, 15, 18, 21, 24시)에 자동으로 일정 알림
-- 🔄 **자동 동기화**: 알림 전 Obsidian 레포 자동 pull
-- 📋 **일정 파싱**: Obsidian Tasks 형식 지원 (due, scheduled, start, recurs)
-- 🎛️ **버튼 메뉴**: 텔레그램 인라인 버튼으로 편리한 조작
+- **정기 알림**: 설정된 시간에 자동으로 일정 알림 (텔레그램에서 설정 가능)
+- **자동 동기화**: 알림 전 Obsidian 레포 자동 pull
+- **일정 파싱**: Obsidian Tasks 형식 지원 (due, scheduled, start, recurs)
+- **인라인 버튼**: Today / Week / Incomplete / Settings 메뉴
+- **설정 관리**: 텔레그램 봇에서 알림 시간 추가/삭제, 테스트 모드 토글
 
 ## 사용 가능한 명령어
 
-| 명령어   | 설명              |
-| -------- | ----------------- |
-| `/start` | 봇 시작           |
-| `/today` | 오늘 일정 보기    |
-| `/week`  | 이번 주 마감 일정 |
-| `/all`   | 미완료 전체 목록  |
-| `/sync`  | 수동 동기화       |
-| `/help`  | 도움말            |
+| 명령어      | 설명                 |
+| ----------- | -------------------- |
+| `/start`    | 메인 메뉴 표시       |
+| `/today`    | 오늘 일정 보기       |
+| `/week`     | 이번 주 일정 (월~일) |
+| `/all`      | 미완료 전체 목록     |
+| `/sync`     | 수동 동기화          |
+| `/settings` | 설정 메뉴            |
+| `/help`     | 도움말               |
 
 ## 설정
 
@@ -30,14 +32,34 @@ Obsidian Tasks를 기반으로 한 텔레그램 일정 관리 봇입니다.
 cp .env.example .env
 ```
 
-```env
-TELEGRAM_BOT_TOKEN=your_bot_token
-TELEGRAM_CHAT_ID=your_chat_id
-NOTIFICATION_HOURS=9,12,15,18,21,0
-TIMEZONE=Asia/Seoul
+필수 설정:
+
+- `TELEGRAM_BOT_TOKEN`: 텔레그램 봇 토큰 ([@BotFather](https://t.me/BotFather)에서 발급)
+- `TELEGRAM_CHAT_ID`: 알림 받을 채팅 ID
+
+Docker 환경에서 private 레포 사용 시:
+
+- `GITHUB_TOKEN`: GitHub Personal Access Token
+- `GITHUB_REPO`: HTTPS 형식의 레포 URL
+
+### 2. 알림 설정 (config.yml)
+
+`config.yml`에서 알림 시간, 타임존, 테스트 모드를 설정합니다.  
+**텔레그램 봇의 Settings 메뉴에서도 수정 가능합니다.**
+
+```yaml
+notification_times:
+  - "09:00"
+  - "12:00"
+  - "15:00"
+  - "18:00"
+  - "21:00"
+  - "00:00"
+timezone: Asia/Seoul
+test_mode: false
 ```
 
-### 2. Obsidian 서브모듈
+### 3. Obsidian 서브모듈
 
 ```bash
 git submodule update --init --recursive
@@ -49,13 +71,13 @@ git submodule update --init --recursive
 
 ```bash
 # 빌드 및 실행
-docker-compose up -d
+docker compose up -d --build
 
 # 로그 확인
-docker-compose logs -f
+docker compose logs -f
 
 # 중지
-docker-compose down
+docker compose down
 ```
 
 ### 로컬 실행
@@ -74,10 +96,11 @@ python scheduler.py
 
 ```markdown
 - [ ] 작업명 [due:: 2026-01-05] # 마감일
+- [ ] 작업명 [due:: 2026-01-05 14:00] # 마감일 + 시간
 - [ ] 작업명 [scheduled:: 2025-12-20] # 예정일
 - [ ] 작업명 [start:: 2025-12-01] # 시작일
-- [ ] 작업명 🔁 every week # 반복
-- [x] 완료 [completion:: 2025-12-22] # 완료일
+- [ ] 작업명 [recurs:: every week] # 반복
+- [x] 완료된 작업 # 완료 표시
 ```
 
 ## 폴더 구조
@@ -86,6 +109,7 @@ python scheduler.py
 00-Scheduler-Bot/
 ├── .env                 # 환경 변수 (git 무시)
 ├── .env.example         # 환경 변수 템플릿
+├── config.yml           # 알림 설정 (봇에서 수정 가능)
 ├── docker-compose.yml   # Docker Compose 설정
 ├── Dockerfile           # Docker 이미지 정의
 ├── requirements.txt     # Python 의존성
@@ -93,3 +117,7 @@ python scheduler.py
 └── obsidian/            # Obsidian 서브모듈
     └── Todo Lists/      # 일정 파일들
 ```
+
+## 라이선스
+
+MIT License
