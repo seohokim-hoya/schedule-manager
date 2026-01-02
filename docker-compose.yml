@@ -1,0 +1,17 @@
+services:
+  scheduler-bot:
+    build: .
+    container_name: obsidian-scheduler-bot
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      # Mount obsidian submodule as read-only for parsing
+      # The git pull happens inside the container
+      - ./obsidian:/app/obsidian:rw
+      # Mount config.yml for persistent settings
+      - ./config.yml:/app/config.yml:rw
+    environment:
+      - TZ=Asia/Seoul
+    # For git operations inside container
+    network_mode: host
