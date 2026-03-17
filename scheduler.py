@@ -3,7 +3,11 @@
 
 import os
 import re
+import sys
+import signal
 import logging
+import asyncio
+import threading
 from datetime import datetime, timedelta, date as date_type
 from pathlib import Path
 from dataclasses import dataclass
@@ -16,7 +20,10 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler,
+    MessageHandler, filters, ContextTypes,
+)
 
 load_dotenv()
 
@@ -26,6 +33,7 @@ CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
 OBSIDIAN_PATH = Path(os.getenv("OBSIDIAN_PATH", "./obsidian"))
 TODO_PATH = Path(os.getenv("TODO_LISTS_PATH", "./obsidian/Todo Lists"))
 CONFIG_PATH = Path(os.getenv("CONFIG_PATH", "./config.yml"))
+GIT_TIMEOUT = 30  # seconds — kill git subprocess if it hangs
 
 # Dynamic Configuration (from config.yml)
 def load_config() -> dict:
@@ -115,7 +123,7 @@ class Task:
             try:
                 h, m = map(int, start_time.split(':'))
                 return (0, datetime.min.replace(hour=h, minute=m))
-            except:
+            except (ValueError, IndexError):
                 pass
         dt = self.primary_dt
         if dt is None:
@@ -124,36 +132,50 @@ class Task:
 
 
 # Git Operations
+_git_lock = threading.Lock()
+
+
 def pull_repo() -> tuple[bool, str]:
-    try:
-        repo = git.Repo(OBSIDIAN_PATH)
-        
-        # Check for GitHub token (for Docker/portable usage)
-        github_token = os.getenv("GITHUB_TOKEN")
-        github_repo = os.getenv("GITHUB_REPO")
-        
-        if github_token and github_repo:
-            # Use HTTPS with token for authentication
-            # Format: https://TOKEN@github.com/user/repo.git
-            auth_url = github_repo.replace("https://", f"https://{github_token}@")
-            # Fetch and pull using authenticated URL
-            repo.git.fetch(auth_url, "main")
-            repo.git.reset("--hard", "FETCH_HEAD")
-            return True, "Synced"
-        else:
-            # Fallback to default remote (SSH or existing config)
-            if not repo.remotes:
-                logger.warning("No remotes configured")
-                return False, "No remotes"
-            origin = repo.remotes.origin if hasattr(repo.remotes, 'origin') else repo.remotes[0]
-            origin.pull()
-            return True, "Synced"
-    except git.InvalidGitRepositoryError:
-        logger.warning(f"{OBSIDIAN_PATH} is not a git repository")
-        return False, "Not a git repo"
-    except Exception as e:
-        logger.error(f"Git pull failed: {e}")
-        return False, "Sync failed"
+    with _git_lock:
+        try:
+            with git.Repo(OBSIDIAN_PATH) as repo:
+                github_token = os.getenv("GITHUB_TOKEN")
+                github_repo = os.getenv("GITHUB_REPO")
+
+                if github_token and github_repo:
+                    auth_url = github_repo.replace(
+                        "https://", f"https://{github_token}@"
+                    )
+                    repo.git.fetch(
+                        auth_url, "main", kill_after_timeout=GIT_TIMEOUT
+                    )
+                    repo.git.reset(
+                        "--hard", "FETCH_HEAD", kill_after_timeout=GIT_TIMEOUT
+                    )
+                    return True, "Synced"
+                else:
+                    if not repo.remotes:
+                        logger.warning("No remotes configured")
+                        return False, "No remotes"
+                    origin = (
+                        repo.remotes.origin
+                        if hasattr(repo.remotes, "origin")
+                        else repo.remotes[0]
+                    )
+                    origin.pull(kill_after_timeout=GIT_TIMEOUT)
+                    return True, "Synced"
+        except git.InvalidGitRepositoryError:
+            logger.warning(f"{OBSIDIAN_PATH} is not a git repository")
+            return False, "Not a git repo"
+        except Exception as e:
+            logger.error(f"Git pull failed: {e}")
+            return False, "Sync failed"
+
+
+async def pull_repo_async() -> tuple[bool, str]:
+    """Run pull_repo in a thread executor to avoid blocking the event loop."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, pull_repo)
 
 
 # Task Parsing
@@ -351,12 +373,13 @@ def fmt_tasks(tasks: list[Task], show_time: bool = True, show_date: bool = False
     return "\n".join(lines)
 
 
-def fmt_overdue(tasks: list[Task]) -> str:
-    """Format overdue tasks with blockquote (HTML)"""
-    if not tasks:
-        return "<i>none</i>"
-    
-    # Group by source, then by date
+def _fmt_grouped_by_source(
+    tasks: list[Task],
+    *,
+    show_count: bool = False,
+    sort_tasks_key=Task.sort_key,
+) -> list[str]:
+    """Format tasks grouped by source then by date. Returns list of HTML lines."""
     by_source: dict[str, dict[Optional[date_type], list[Task]]] = {}
     for t in tasks:
         if t.source not in by_source:
@@ -364,34 +387,46 @@ def fmt_overdue(tasks: list[Task]) -> str:
         dt = t.primary_dt
         date_key = dt.date() if dt else None
         by_source[t.source].setdefault(date_key, []).append(t)
-    
-    lines = []
+
+    lines: list[str] = []
     for src in sorted(by_source):
         src_tasks = by_source[src]
-        lines.append(f"<b>{esc(src)}</b>")
-        
+        if show_count:
+            total = sum(len(v) for v in src_tasks.values())
+            lines.append(f"<b>{esc(src)}</b> ({total})")
+        else:
+            lines.append(f"<b>{esc(src)}</b>")
+
         sorted_dates = sorted(
             src_tasks.keys(),
-            key=lambda d: (d is None, d or date_type.max)
+            key=lambda d: (d is None, d or date_type.max),
         )
-        
+
         for d in sorted_dates:
-            date_tasks = src_tasks[d]
-            date_tasks_sorted = sorted(date_tasks, key=lambda t: t.primary_dt or datetime.max)
-            
-            for t in date_tasks_sorted:
+            date_tasks = sorted(src_tasks[d], key=sort_tasks_key)
+            for t in date_tasks:
                 time_str = t.display_time or "all-day"
                 date_str = d.strftime('%m/%d') if d else "no date"
                 recur = " (repeat)" if t.recurrence else ""
-                
+
                 parts = [f"<code>{date_str}</code>", f"<code>{time_str}</code>"]
                 if t.place:
                     parts.append(esc(t.place))
-                
+
                 lines.append(" · ".join(parts))
                 lines.append(f"<blockquote>{esc(t.text)}{recur}</blockquote>")
-    
-    return "\n".join(lines)
+        lines.append("")
+    return lines
+
+
+def fmt_overdue(tasks: list[Task]) -> str:
+    """Format overdue tasks grouped by source (HTML)"""
+    if not tasks:
+        return "<i>none</i>"
+    lines = _fmt_grouped_by_source(
+        tasks, sort_tasks_key=lambda t: t.primary_dt or datetime.max
+    )
+    return "\n".join(lines).rstrip()
 
 
 def build_daily(tasks: list[Task], include_completed: bool = False) -> str:
@@ -445,47 +480,13 @@ def build_weekly(tasks: list[Task], include_completed: bool = False) -> str:
 
 def build_all(tasks: list[Task]) -> str:
     incomplete = get_incomplete(tasks)
-    
-    # Group by source, then by date
-    by_source: dict[str, dict[Optional[date_type], list[Task]]] = {}
-    for t in incomplete:
-        if t.source not in by_source:
-            by_source[t.source] = {}
-        dt = t.primary_dt
-        date_key = dt.date() if dt else None
-        by_source[t.source].setdefault(date_key, []).append(t)
 
     lines = [f"<b>All Incomplete</b>", f"total {len(incomplete)}\n"]
 
     if not incomplete:
         lines.append("<i>all done</i>")
     else:
-        for src in sorted(by_source):
-            src_tasks = by_source[src]
-            total = sum(len(v) for v in src_tasks.values())
-            lines.append(f"<b>{esc(src)}</b> ({total})")
-            
-            sorted_dates = sorted(
-                src_tasks.keys(),
-                key=lambda d: (d is None, d or date_type.max)
-            )
-            
-            for d in sorted_dates:
-                date_tasks = src_tasks[d]
-                date_tasks_sorted = sorted(date_tasks, key=Task.sort_key)
-                
-                for t in date_tasks_sorted:
-                    time_str = t.display_time or "all-day"
-                    date_str = d.strftime('%m/%d') if d else "no date"
-                    recur = " (repeat)" if t.recurrence else ""
-                    
-                    parts = [f"<code>{date_str}</code>", f"<code>{time_str}</code>"]
-                    if t.place:
-                        parts.append(esc(t.place))
-                    
-                    lines.append(" · ".join(parts))
-                    lines.append(f"<blockquote>{esc(t.text)}{recur}</blockquote>")
-            lines.append("")
+        lines.extend(_fmt_grouped_by_source(incomplete, show_count=True))
 
     return "\n".join(lines)
 
@@ -533,22 +534,22 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    pull_repo()
+    await pull_repo_async()
     await update.message.reply_text(build_daily(get_all_tasks()), parse_mode="HTML", reply_markup=KEYBOARD)
 
 
 async def cmd_week(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    pull_repo()
+    await pull_repo_async()
     await update.message.reply_text(build_weekly(get_all_tasks()), parse_mode="HTML", reply_markup=KEYBOARD)
 
 
 async def cmd_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    pull_repo()
+    await pull_repo_async()
     await update.message.reply_text(build_all(get_all_tasks()), parse_mode="HTML", reply_markup=KEYBOARD)
 
 
 async def cmd_sync(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    _, msg = pull_repo()
+    _, msg = await pull_repo_async()
     await update.message.reply_text(msg)
 
 
@@ -656,7 +657,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     
     # Default callbacks
-    pull_repo()
+    await pull_repo_async()
     tasks = get_all_tasks()
     text = CALLBACKS.get(data, lambda _: "알 수 없는 명령")(tasks)
     await ctx.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=KEYBOARD)
@@ -665,7 +666,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # Scheduler
 async def send_notification(app: Application):
     logger.info("Sending scheduled notification...")
-    pull_repo()
+    await pull_repo_async()
     try:
         await app.bot.send_message(chat_id=CHAT_ID, text=build_daily(get_all_tasks()), parse_mode="HTML", reply_markup=KEYBOARD)
         logger.info("Notification sent")
@@ -700,7 +701,6 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text = update.message.text.strip()
         
         # Validate time format
-        import re
         if not re.match(r"^\d{1,2}:\d{2}$", text):
             await update.message.reply_text("Invalid format. Use HH:MM (e.g. 14:30)")
             return
@@ -711,7 +711,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if not (0 <= h <= 23 and 0 <= m <= 59):
                 raise ValueError()
             time_str = f"{h:02d}:{m:02d}"
-        except:
+        except (ValueError, TypeError):
             await update.message.reply_text("Invalid time. Use HH:MM (e.g. 14:30)")
             return
         
@@ -754,11 +754,20 @@ def main():
     app.add_handler(CallbackQueryHandler(on_callback))
     
     # Message handler for settings input (must be last)
-    from telegram.ext import MessageHandler, filters
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     scheduler = setup_scheduler(app)
     scheduler.start()
+
+    # Graceful shutdown: clean up git processes on SIGTERM/SIGINT (Docker stop)
+    def shutdown_handler(signum, frame):
+        logger.info(f"Received signal {signum}, shutting down gracefully...")
+        if scheduler:
+            scheduler.shutdown(wait=False)
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, shutdown_handler)
+    signal.signal(signal.SIGINT, shutdown_handler)
 
     logger.info("Bot running...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
